@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/google/uuid"
@@ -71,9 +72,62 @@ func (s AGPLIDPSync) GroupSyncSettings(ctx context.Context, orgID uuid.UUID, db 
 	return settings, nil
 }
 
-func (s AGPLIDPSync) ParseGroupClaims(_ context.Context, _ jwt.MapClaims) (GroupParams, *HTTPError) {
+// func (s AGPLIDPSync) ParseGroupClaims(_ context.Context, _ jwt.MapClaims) (GroupParams, *HTTPError) {
+// 	return GroupParams{
+// 		SyncEntitled: s.GroupSyncEntitled(),
+// 	}, nil
+// }
+
+func (s AGPLIDPSync) ParseGroupClaims(_ context.Context, mergedClaims jwt.MapClaims) (GroupParams, *HTTPError) {
+	if s.GroupField != "" && len(s.GroupAllowList) > 0 {
+		groupsRaw, ok := mergedClaims[s.GroupField]
+		if !ok {
+			return GroupParams{}, &HTTPError{
+				Code:             http.StatusForbidden,
+				Msg:              "Not a member of an allowed group",
+				Detail:           "You have no groups in your claims!",
+				RenderStaticPage: true,
+			}
+		}
+		parsedGroups, err := ParseStringSliceClaim(groupsRaw)
+		if err != nil {
+			return GroupParams{}, &HTTPError{
+				Code:             http.StatusBadRequest,
+				Msg:              "Failed read groups from claims for allow list check. Ask an administrator for help.",
+				Detail:           err.Error(),
+				RenderStaticPage: true,
+			}
+		}
+
+		inAllowList := false
+		var groupsVerified []string
+		// AllowListCheckLoop:
+		for _, group := range parsedGroups {
+			if _, ok := s.GroupAllowList[group]; ok {
+				groupsVerified = append(groupsVerified, group)
+				// inAllowList = true
+				// break AllowListCheckLoop
+			}
+		}
+		
+		if len(groupsVerified) > 0 {
+			inAllowList = true
+			groupsVerified = append(groupsVerified, "Everyone")
+			mergedClaims[s.GroupField] = groupsVerified
+		}
+		if !inAllowList {
+			return GroupParams{}, &HTTPError{
+				Code:             http.StatusForbidden,
+				Msg:              "Not a member of an allowed group",
+				Detail:           "Ask an administrator to add one of your groups to the allow list.",
+				RenderStaticPage: true,
+			}
+		}
+	}
+
 	return GroupParams{
-		SyncEntitled: s.GroupSyncEntitled(),
+		SyncEntitled: true,
+		MergedClaims: mergedClaims,
 	}, nil
 }
 
