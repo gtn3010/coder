@@ -7,8 +7,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -155,6 +157,26 @@ func (s *server) Plan(
 	}
 	env = otelEnvInject(ctx, env)
 
+	templateName := request.Metadata.GetTemplateName()
+	// template name is "" in request plan for creating template version (template name is not passed in request create template version). Get tenant name from terraform variable we pass to when creating template.
+	for _, templateVariable := range request.VariableValues {
+		// define terraform variable in template with name: aws_account_name for mapping aws role arn.
+		if templateVariable.GetName() == "aws_account_name" {
+			templateName = templateVariable.GetValue()
+		}
+	}
+	env, tokenFilePath, err := injectAwsEnv(ctx, templateName, env)
+	s.logger.Debug(ctx, "generated token file path is: ", "path", tokenFilePath)
+	if err != nil {
+		return provisionersdk.PlanErrorf("inject aws authentication env variables for tenant accounts failed: %s", err)
+	}
+	defer func() {
+		s.logger.Debug(ctx, "start to remove temporary token dir", "file", tokenFilePath)
+		if err = clearTokenDir(tokenFilePath); err != nil {
+			s.logger.Debug(ctx, "failed to remove temporary token dir with ", "error", err)
+		}
+	}()
+
 	vars, err := planVars(request)
 	if err != nil {
 		return provisionersdk.PlanErrorf("plan vars: %s", err)
@@ -204,6 +226,21 @@ func (s *server) Apply(
 		return provisionersdk.ApplyErrorf("provision env: %s", err)
 	}
 	env = otelEnvInject(ctx, env)
+
+	templateName := request.Metadata.GetTemplateName()
+	s.logger.Debug(ctx, "template name when applying", "name", templateName)
+	env, tokenFilePath, err := injectAwsEnv(ctx, templateName, env)
+	s.logger.Debug(ctx, "generated token file path is: ", "path", tokenFilePath)
+	if err != nil {
+		return provisionersdk.ApplyErrorf("inject aws authentication env variable for tenant accounts failed: %s", err)
+	}
+	defer func() {
+		s.logger.Debug(ctx, "start to remove temporary token dir", "file", tokenFilePath)
+		if err = clearTokenDir(tokenFilePath); err != nil {
+			s.logger.Debug(ctx, "failed to remove temporary token dir with ", "error", err)
+		}
+	}()
+
 	resp, err := e.apply(
 		ctx, killCtx, env, sess,
 	)
@@ -383,4 +420,91 @@ func tryGettingCoderProviderStacktrace(sess *provisionersdk.Session) string {
 // the provider, we can remove this function.
 func gitAuthAccessTokenEnvironmentVariable(id string) string {
 	return fmt.Sprintf("CODER_GIT_AUTH_ACCESS_TOKEN_%s", id)
+}
+
+func injectAwsEnv(ctx context.Context, templateName string, env []string) ([]string, string, error) {
+	// format: "tenant1:accountid,tenant2:accountid2"
+	tenants := os.Getenv("MULTITENANT_WORKSPACES")
+	coderAwsRoleName := os.Getenv("CODER_AWS_ROLE_NAME")
+	parsedTenants := strings.Split(tenants, ",")
+	for _, tenant := range parsedTenants {
+		account := strings.Split(tenant, ":")
+		if account[0] == templateName {
+			tokenFilePath, err := getInfraIdentityToken(ctx, templateName)
+			if err != nil {
+				return env, tokenFilePath, xerrors.Errorf("failed to get infra identity token: %w", err)
+			}
+			// for loop env , remove all string with pattern AWS_* => inject other AWS env variable
+			env = slices.DeleteFunc(env, func(n string) bool {
+				return strings.Contains(n, "AWS") // remove any env variables with AWS in key.
+			})
+			envAwsIDToken := fmt.Sprintf("AWS_WEB_IDENTITY_TOKEN_FILE=%s", tokenFilePath)
+			envAwsRoleArn := fmt.Sprintf("AWS_ROLE_ARN=arn:aws:iam::%s:role/%s", account[1], coderAwsRoleName)
+			env = append(env,
+				envAwsIDToken,
+				envAwsRoleArn,
+				"AWS_STS_REGIONAL_ENDPOINTS=regional",
+				"AWS_REGION=ap-southeast-1",
+			)
+			return env, tokenFilePath, nil
+		}
+	}
+	return env, "", nil
+}
+
+func getInfraIdentityToken(ctx context.Context, tenant string) (string, error) {
+	// run jwt provider as sidecar container with custom coder pod.
+	tokenProvideBaserURL := os.Getenv("IDP_URL")
+	issuerURL := os.Getenv("IDENTITY_PROVIDER_ISSUER_URL")
+	if tokenProvideBaserURL == "" {
+		return "", xerrors.Errorf("set idp url env variable for requesting jwt to authenticate with AWS")
+	}
+
+	// set query parameters to define claims we want in jwt
+	queryParams := url.Values{}
+	// define aud claim for authn with aws
+	queryParams.Set("aud", "sts.amazonaws.com")
+	queryParams.Set("sub", fmt.Sprintf("coder-%s", tenant))
+
+	tokenProviderURL := fmt.Sprintf("%s?%s", tokenProvideBaserURL, queryParams.Encode())
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenProviderURL, nil)
+	if err != nil {
+		return "", err
+	}
+	// set host header for request getting aws identity token to set issuer claim in jwt.
+	req.Host = issuerURL
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	tempDir, err := os.MkdirTemp("", tenant)
+	if err != nil {
+		return "", err
+	}
+	tokenFilePath := filepath.Join(tempDir, "token")
+	if err := os.WriteFile(tokenFilePath, body, 0600); err != nil {
+		return "", err
+	}
+	return tokenFilePath, nil
+}
+
+func clearTokenDir(tokenFilePath string) error {
+	if tokenFilePath != "" {
+		tokenDirPath := strings.TrimSuffix(tokenFilePath, "/token")
+		err := os.RemoveAll(tokenDirPath)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
