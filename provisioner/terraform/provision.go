@@ -7,8 +7,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -157,6 +159,16 @@ func (s *server) Plan(
 		return provisionersdk.PlanErrorf("setup env: %s", err)
 	}
 
+	templateName := request.Metadata.GetTemplateName()
+	workspaceBuildID := request.Metadata.GetWorkspaceBuildId()
+	tenants := os.Getenv("MULTITENANT_WORKSPACES")
+	if tenants != "" {
+		env, err = injectAwsEnv(ctx, templateName, tenants, workspaceBuildID, env)
+		if err != nil {
+			return provisionersdk.PlanErrorf("inject aws authentication env variable for tenant accounts failed: %s", err)
+		}
+	}
+
 	vars, err := planVars(request)
 	if err != nil {
 		return provisionersdk.PlanErrorf("plan vars: %s", err)
@@ -168,6 +180,13 @@ func (s *server) Plan(
 	)
 	if err != nil {
 		return provisionersdk.PlanErrorf("%s", err.Error())
+	}
+
+	if tenants != "" {
+		err = clearTokenFile(templateName, workspaceBuildID)
+		if err != nil {
+			s.logger.Debug(ctx, "clear identity aws token file path failed after terraform plan")
+		}
 	}
 
 	// Prepend init timings since they occur prior to plan timings.
@@ -208,6 +227,15 @@ func (s *server) Apply(
 	if err != nil {
 		return provisionersdk.ApplyErrorf("provision env: %s", err)
 	}
+	templateName := request.Metadata.GetTemplateName()
+	workspaceBuildID := request.Metadata.GetWorkspaceBuildId()
+	tenants := os.Getenv("MULTITENANT_WORKSPACES")
+	if tenants != "" {
+		env, err = injectAwsEnv(ctx, templateName, tenants, workspaceBuildID, env)
+		if err != nil {
+			return provisionersdk.ApplyErrorf("inject aws authentication env variable for tenant accounts failed: %s", err)
+		}
+	}
 	resp, err := e.apply(
 		ctx, killCtx, env, sess,
 	)
@@ -219,6 +247,12 @@ func (s *server) Apply(
 		return &proto.ApplyComplete{
 			State: stateData,
 			Error: errorMessage,
+		}
+	}
+	if tenants != "" {
+		err = clearTokenFile(templateName, workspaceBuildID)
+		if err != nil {
+			s.logger.Debug(ctx, "clear identity aws token file path failed after terraform apply")
 		}
 	}
 	return resp
@@ -241,7 +275,6 @@ func provisionEnv(
 	if err != nil {
 		return nil, xerrors.Errorf("marshal owner groups: %w", err)
 	}
-
 	env = append(env,
 		"CODER_AGENT_URL="+metadata.GetCoderUrl(),
 		"CODER_WORKSPACE_TRANSITION="+strings.ToLower(metadata.GetWorkspaceTransition().String()),
@@ -349,4 +382,78 @@ func tryGettingCoderProviderStacktrace(sess *provisionersdk.Session) string {
 		sess.Logger.Error(sess.Context(), "could not read stack traces", slog.Error(err))
 	}
 	return string(stacktraces)
+}
+
+func injectAwsEnv(ctx context.Context, templateName string, tenants string, workspaceBuildID string, env []string) ([]string, error) {
+	// format https://url => need to validate this url
+	issuerURL := os.Getenv("IDENTITY_PROVIDER_ISSUER_URL")
+	filteredTenants := strings.Split(tenants, ",")
+	if slices.Contains(filteredTenants, templateName) {
+		err := getInfraIdentityToken(ctx, templateName, workspaceBuildID, issuerURL)
+		if err != nil {
+			return env, xerrors.Errorf("failed to get infra identity token: %w", err)
+		}
+		// for loop env , remove all string with pattern AWS_* => inject other AWS env variable
+		env = slices.DeleteFunc(env, func(n string) bool {
+			return strings.Contains(n, "AWS") // remove any env variables with AWS in key.
+		})
+		envAWSIdToken := fmt.Sprintf("AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/token/%s/%s", templateName, workspaceBuildID)
+		env = append(env,
+			envAWSIdToken,
+			"AWS_STS_REGIONAL_ENDPOINTS=regional",
+			"AWS_REGION=ap-southeast-1",
+		)
+	}
+	return env, nil
+}
+
+func getInfraIdentityToken(ctx context.Context, tenant string, workspaceBuildID string, issuerURL string) error {
+	// run jwt provider as sidecar container with custom coder pod.
+	tokenProvideBaserURL := "http://localhost:8080/token"
+
+	// set query parameters to define claims we want in jwt
+	queryParams := url.Values{}
+	// define aud claim for authn with aws
+	queryParams.Set("aud", "sts.amazonaws.com")
+
+	tokenProviderURL := fmt.Sprintf("%s?%s", tokenProvideBaserURL, queryParams.Encode())
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenProviderURL, nil)
+	if err != nil {
+		// log.Fatalf("Failed to create request for generating identity token: %v", err)
+		return err
+	}
+	// set host header for request getting aws identity token to set issuer claim in jwt.
+	req.Host = issuerURL
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		// log.Fatalf("Failed to send for generating identity token: %v", err)
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		// log.Fatalf("Failed to read response identity token:: %v", err)
+		return err
+	}
+
+	tokenFilePath := fmt.Sprintf("/tmp/token/%s/%s", tenant, workspaceBuildID)
+	err = os.WriteFile(tokenFilePath, body, 0600)
+	if err != nil {
+		// fmt.Printf("Failed to write to file: %v\n", err)
+		return err
+	}
+	return nil
+}
+
+func clearTokenFile(templateName string, workspaceBuildID string) error {
+	tokenFilePath := fmt.Sprintf("/tmp/token/%s/%s", templateName, workspaceBuildID)
+	err := os.Remove(tokenFilePath)
+	if err != nil {
+		return err
+	}
+	return nil
 }
