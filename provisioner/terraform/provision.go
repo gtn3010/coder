@@ -409,12 +409,16 @@ func injectAwsEnv(ctx context.Context, templateName string, tenants string, work
 
 func getInfraIdentityToken(ctx context.Context, tenant string, workspaceBuildID string, issuerURL string) error {
 	// run jwt provider as sidecar container with custom coder pod.
-	tokenProvideBaserURL := "http://localhost:8080/token"
+	tokenProvideBaserURL := os.Getenv("IDP_URL")
+	if tokenProvideBaserURL == "" {
+		return xerrors.Errorf("set idp url env variable for requesting jwt to authenticate with AWS")
+	}
 
 	// set query parameters to define claims we want in jwt
 	queryParams := url.Values{}
 	// define aud claim for authn with aws
 	queryParams.Set("aud", "sts.amazonaws.com")
+	queryParams.Set("sub", fmt.Sprintf("coder-%s", tenant))	
 
 	tokenProviderURL := fmt.Sprintf("%s?%s", tokenProvideBaserURL, queryParams.Encode())
 
