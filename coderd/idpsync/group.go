@@ -94,12 +94,20 @@ func (s AGPLIDPSync) ParseGroupClaims(_ context.Context, mergedClaims jwt.MapCla
 		}
 
 		inAllowList := false
-	AllowListCheckLoop:
+		//	AllowListCheckLoop:
+		var groupsVerified []string
 		for _, group := range parsedGroups {
 			if _, ok := s.GroupAllowList[group]; ok {
-				inAllowList = true
-				break AllowListCheckLoop
+				groupsVerified = append(groupsVerified, group)
+				// inAllowList = true
+				// break AllowListCheckLoop
 			}
+		}
+
+		if len(groupsVerified) > 0 {
+			inAllowList = true
+			groupsVerified = append(groupsVerified, "Everyone")
+			mergedClaims[s.GroupField] = groupsVerified
 		}
 
 		if !inAllowList {
@@ -120,9 +128,10 @@ func (s AGPLIDPSync) ParseGroupClaims(_ context.Context, mergedClaims jwt.MapCla
 
 func (s AGPLIDPSync) SyncGroups(ctx context.Context, db database.Store, user database.User, params GroupParams) error {
 	// Nothing happens if sync is not enabled
-	if !params.SyncEntitled {
-		return nil
-	}
+	// if !params.SyncEntitled {
+	// 	return nil
+	// }
+	// comment above code for enabling sync groups feature.
 
 	// nolint:gocritic // all syncing is done as a system user
 	ctx = dbauthz.AsSystemRestricted(ctx)
