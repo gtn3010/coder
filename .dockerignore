@@ -1,0 +1,7 @@
+.claude
+.devcontainer
+.vscode
+.git
+.vscode
+.pnpm-store
+node_modules
