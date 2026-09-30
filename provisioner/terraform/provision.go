@@ -215,14 +215,14 @@ func (s *server) Plan(
 		}
 	}
 	env, tokenFilePath, err := injectAwsEnv(ctx, templateName, env)
-	s.logger.Debug(ctx, "generated token file path is: ", "path", tokenFilePath)
+	s.logger.Debug(ctx, "generated token file path is: ", slog.F("path", tokenFilePath))
 	if err != nil {
 		return provisionersdk.PlanErrorf("inject aws authentication env variables for tenant accounts failed: %s", err)
 	}
 	defer func() {
-		s.logger.Debug(ctx, "start to remove temporary token dir", "file", tokenFilePath)
+		s.logger.Debug(ctx, "start to remove temporary token dir", slog.F("in path", tokenFilePath))
 		if err = clearTokenDir(tokenFilePath); err != nil {
-			s.logger.Debug(ctx, "failed to remove temporary token dir with ", "error", err)
+			s.logger.Debug(ctx, "failed to remove temporary token dir with ", slog.Error(err))
 		}
 	}()
 
@@ -338,16 +338,16 @@ func (s *server) Apply(
 	env = otelEnvInject(ctx, env)
 
 	templateName := request.Metadata.GetTemplateName()
-	s.logger.Debug(ctx, "template name when applying", "name", templateName)
+	s.logger.Debug(ctx, "template name when applying", slog.F("template", templateName))
 	env, tokenFilePath, err := injectAwsEnv(ctx, templateName, env)
-	s.logger.Debug(ctx, "generated token file path is: ", "path", tokenFilePath)
+	s.logger.Debug(ctx, "generated token file", slog.F("path: ", tokenFilePath))
 	if err != nil {
 		return provisionersdk.ApplyErrorf("inject aws authentication env variable for tenant accounts failed: %s", err)
 	}
 	defer func() {
-		s.logger.Debug(ctx, "start to remove temporary token dir", "file", tokenFilePath)
+		s.logger.Debug(ctx, "start to remove temporary token dir", slog.F("file: ", tokenFilePath))
 		if err = clearTokenDir(tokenFilePath); err != nil {
-			s.logger.Debug(ctx, "failed to remove temporary token dir with ", "error", err)
+			s.logger.Debug(ctx, "failed to remove temporary token dir with", slog.Error(err))
 		}
 	}()
 
